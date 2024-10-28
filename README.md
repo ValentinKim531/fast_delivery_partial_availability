@@ -13,3 +13,15 @@
 ### Если самая дешевая и самая быстрая аптеки закрыты на момент запроса, 
 но стоимость корзины в этих аптеках меньше на 30% по сравнению с другими аптеками:
 - возвращаем эту аптеку вместе с другой, открытой аптекой (сначала открытая аптека, а в альтернативной - закрытая)
+
+
+## Результат:
+
+```
+return {
+        "cheapest_delivery_option": cheapest_open_pharmacy,
+        "alternative_cheapest_option": alternative_cheapest_option,
+        "fastest_delivery_option": fastest_open_pharmacy,
+        "alternative_fastest_option": alternative_fastest_option
+    }
+```

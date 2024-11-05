@@ -7,7 +7,6 @@ import logging
 from fastapi.middleware.cors import CORSMiddleware
 import json
 from dotenv import load_dotenv
-from collections import defaultdict
 from datetime import datetime, timedelta
 import pytz
 
@@ -52,8 +51,6 @@ async def main_process(request: Request):
             if not isinstance(item.get("sku"), str) or not isinstance(item.get("count_desired"), int):
                 return JSONResponse(content={"error": "Invalid SKU format or count type"}, status_code=400)
 
-        # Первый SKU приоритетный
-        priority_sku = sku_data[0]["sku"]
 
         payload = [{"sku": item["sku"], "count_desired": item["count_desired"]} for item in sku_data]
 
@@ -66,40 +63,17 @@ async def main_process(request: Request):
         save_response_to_file(pharmacies, file_name='data1_found_all.json')
 
         # Поиск аптек с учетом наличия приоритетного товара
-        priority_pharmacies = await filter_pharmacies_with_priority(pharmacies, priority_sku)
-        save_response_to_file(priority_pharmacies, file_name='data2_found_with_priority.json')
+        filtered_pharmacies = await filter_pharmacies_by_priority_items(pharmacies, sku_data)
+        if isinstance(filtered_pharmacies, JSONResponse):
+            return filtered_pharmacies
+        save_response_to_file(filtered_pharmacies, file_name='data2_found_with_priority.json')
 
-
-        if not priority_pharmacies.get("filtered_pharmacies"):
-            # Если нет аптек с приоритетным товаром, продолжаем с неполным набором
-            partial_pharmacies = await filter_pharmacies_with_priority_and_analogs(pharmacies, priority_sku)
-            if not partial_pharmacies.get("filtered_pharmacies"):
-                logger.error(
-                    "No pharmacies found matching the request (either due to requested medication quantities or invalid SKU(s))")
-                return JSONResponse(content={
-                    "error": "No pharmacies found matching the request (either due to requested medication quantities or invalid SKU(s))"},
-                                    status_code=404)
-            save_response_to_file(partial_pharmacies, file_name='data2_pharmacies_with_replacements.json')
-        else:
-            # Если аптеки с приоритетным товаром есть, фильтруем с учетом аналогов
-            partial_pharmacies = await filter_pharmacies_with_priority_and_analogs(priority_pharmacies, priority_sku)
-            if not partial_pharmacies.get("filtered_pharmacies"):
-                logger.error(
-                    "No pharmacies found matching the request (either due to requested medication quantities or invalid SKU(s))")
-                return JSONResponse(content={
-                    "error": "No pharmacies found matching the request (either due to requested medication quantities or invalid SKU(s))"},
-                                    status_code=404)
-            save_response_to_file(partial_pharmacies, file_name='data2_pharmacies_with_replacements.json')
-
-        # Сортировка по наибольшему количеству доступных товаров
-        top_pharmacies = await sort_pharmacies_by_fulfillment(partial_pharmacies)
-        save_response_to_file(top_pharmacies, file_name='data3_sorted_pharmacies.json')
 
         # Выбор ближайших и самых дешевых аптек
-        closest_pharmacies = await get_top_closest_pharmacies(top_pharmacies, user_lat, user_lon)
+        closest_pharmacies = await get_top_closest_pharmacies(filtered_pharmacies, user_lat, user_lon)
         save_response_to_file(closest_pharmacies, file_name='data4_top_closest_pharmacies.json')
 
-        cheapest_pharmacies = await get_top_cheapest_pharmacies(top_pharmacies)
+        cheapest_pharmacies = await get_top_cheapest_pharmacies(filtered_pharmacies)
         save_response_to_file(cheapest_pharmacies, file_name='data4_top_cheapest_pharmacies.json')
 
 
@@ -155,170 +129,112 @@ async def find_medicines_in_pharmacies(encoded_city, payload):
 #         return data  # Возвращаем JSON данные
 
 
-# Фильтр аптек с учетом приоритетного товара
-async def filter_pharmacies_with_priority(pharmacies, priority_sku):
-    filtered_pharmacies = []
-
-    # Проверка наличия данных
+# Фильтр аптек с учетом приоритетности товаров от первого в списке запроса и далее
+async def filter_pharmacies_by_priority_items(pharmacies, priority_skus):
+    """
+    Функция для последовательного фильтрации аптек по приоритетным товарам с учетом аналогов.
+    """
     if "result" not in pharmacies or not isinstance(pharmacies["result"], list):
+        logger.error("Invalid pharmacies data format.")
         return JSONResponse(content={"error": "Invalid pharmacies data format"}, status_code=502)
 
-    for pharmacy in pharmacies.get("result", []):
-        products = pharmacy.get("products", [])
+    filtered_pharmacies = pharmacies.get("result", [])
+    logger.info(f"Initial pharmacies count: {len(filtered_pharmacies)}")
 
-        # Проверяем наличие приоритетного лекарства с ненулевым количеством
-        has_priority_sku = any(product["sku"] == priority_sku and product["quantity"] != 0 for product in products)
+    for round_number, priority_sku in enumerate(priority_skus, start=1):
+        logger.info(f"Processing priority SKU: {priority_sku}")
+        temp_filtered_pharmacies = []
 
-        # Если приоритетное лекарство найдено с ненулевым количеством, добавляем аптеку
-        if has_priority_sku:
-            filtered_pharmacies.append(pharmacy)
-        else:
-            # Если приоритетное лекарство найдено, но его количество равно 0
-            for product in products:
-                if product["sku"] == priority_sku and product["quantity"] == 0:
-                    # Проверяем наличие аналогов с ненулевым количеством
-                    has_valid_analog = any(analog["quantity"] != 0 for analog in product.get("analogs", []))
-                    if has_valid_analog:
-                        filtered_pharmacies.append(pharmacy)
-                        break  # Прекращаем поиск после нахождения подходящего аналога
+        for pharmacy in filtered_pharmacies:
+            products = pharmacy.get("products", [])
+            updated_products = products[:]  # Копируем все продукты для сохранения исходного порядка
+            replacements_needed = 0
+            replaced_skus = []
+            total_sum = 0
+            product_found = False
 
-    # Логирование результатов перед сохранением
-    print(f"Найдено аптек с приоритетным товаром или аналогом: {len(filtered_pharmacies)}")
+            for product in updated_products:
+                if product["sku"] == priority_sku["sku"]:
+                    if product["quantity"] >= priority_sku["count_desired"]:
+                        # Обновляем количество для приоритетного товара
+                        product_total_price = product["base_price"] * priority_sku["count_desired"]
+                        total_sum += product_total_price
+                        product["quantity_desired"] = priority_sku["count_desired"]
+                        product_found = True
+                        break
+                    else:
+                        # Если недостаточно, ищем аналог
+                        cheapest_analog = min(
+                            product.get("analogs", []),
+                            key=lambda analog: analog["base_price"],
+                            default=None
+                        )
+                        if cheapest_analog and cheapest_analog["quantity"] >= priority_sku["count_desired"]:
+                            replacement_product = {
+                                "source_code": cheapest_analog["source_code"],
+                                "sku": cheapest_analog["sku"],
+                                "name": cheapest_analog["name"],
+                                "base_price": cheapest_analog["base_price"],
+                                "price_with_warehouse_discount": cheapest_analog["price_with_warehouse_discount"],
+                                "warehouse_discount": cheapest_analog["warehouse_discount"],
+                                "quantity": cheapest_analog["quantity"],
+                                "quantity_desired": priority_sku["count_desired"],
+                                "diff": product["diff"],
+                                "avg_price": product["avg_price"],
+                                "min_price": product["min_price"],
+                                "pp_packing": cheapest_analog.get("pp_packing", ""),
+                                "manufacturer_id": cheapest_analog.get("manufacturer_id", ""),
+                                "recipe_needed": cheapest_analog.get("recipe_needed", False),
+                                "strong_recipe": cheapest_analog.get("strong_recipe", False),
+                            }
+                            analog_total_price = cheapest_analog["base_price"] * priority_sku["count_desired"]
+                            total_sum += analog_total_price
+                            updated_products = [
+                                replacement_product if p["sku"] == product["sku"] else p for p in updated_products
+                            ]
+                            replacements_needed += 1
+                            replaced_skus.append({
+                                "original_sku": product["sku"],
+                                "replacement_sku": cheapest_analog["sku"]
+                            })
+                            product_found = True
+                            break
+
+            if product_found:
+                # Сохраняем всю аптеку с обновленными продуктами
+                temp_filtered_pharmacies.append({
+                    "source": pharmacy["source"],
+                    "products": updated_products,
+                    "total_sum": total_sum,
+                    "replacements_needed": replacements_needed,
+                    "replaced_skus": replaced_skus
+                })
+
+        # Обновляем список аптек для следующего SKU
+        filtered_pharmacies = temp_filtered_pharmacies
+        logger.info(f"Filtered pharmacies count after SKU '{priority_sku}': {len(filtered_pharmacies)}")
+
+        # Прерываем цикл, если на текущем этапе не осталось аптек
+        if not filtered_pharmacies:
+            logger.info(f"No pharmacies found after filtering for SKU '{priority_sku}'")
+            return JSONResponse(content={
+                "error": "No pharmacies found meeting the SKU requirements or available quantities."
+            }, status_code=404)
+
+        # Сохраняем промежуточный результат для отладки
+        save_response_to_file({"filtered_pharmacies": filtered_pharmacies},
+                              file_name=f'data_round_{round_number}_filtered_pharmacies.json')
 
     return {"filtered_pharmacies": filtered_pharmacies}
 
 
-async def filter_pharmacies_with_priority_and_analogs(pharmacies, priority_sku):
-    pharmacies_with_replacements = []
 
-    # Проходим по аптекам
-    for pharmacy in pharmacies.get("filtered_pharmacies") or pharmacies.get("result", []):
-        products = pharmacy.get("products", [])
-        updated_products = []  # Обновленный список товаров (с аналогами и приоритетным товаром)
-        total_sum = 0  # Общая сумма заказа
-        replacements_needed = 0  # Количество замен
-        replaced_skus = []  # Список замененных товаров
-
-        for product in products:
-            if product["sku"] == priority_sku:
-                # Обрабатываем приоритетный товар
-                if product["quantity"] >= product["quantity_desired"]:
-                    product_total_price = product["base_price"] * product["quantity_desired"]
-                    total_sum += product_total_price
-                    updated_products.append(product)
-                else:
-                    # Проверяем наличие аналога для приоритетного товара
-                    cheapest_analog = min(product.get("analogs", []), key=lambda analog: analog["base_price"], default=None)
-                    if cheapest_analog and cheapest_analog["quantity"] >= product["quantity_desired"]:
-                        replacement_product = {
-                            "source_code": cheapest_analog["source_code"],
-                            "sku": cheapest_analog["sku"],
-                            "name": cheapest_analog["name"],
-                            "base_price": cheapest_analog["base_price"],
-                            "price_with_warehouse_discount": cheapest_analog["price_with_warehouse_discount"],
-                            "warehouse_discount": cheapest_analog["warehouse_discount"],
-                            "quantity": cheapest_analog["quantity"],
-                            "quantity_desired": product["quantity_desired"],
-                            "diff": product["diff"],
-                            "avg_price": product["avg_price"],
-                            "min_price": product["min_price"],
-                            "pp_packing": cheapest_analog.get("pp_packing", ""),
-                            "manufacturer_id": cheapest_analog.get("manufacturer_id", ""),
-                            "recipe_needed": cheapest_analog.get("recipe_needed", False),
-                            "strong_recipe": cheapest_analog.get("strong_recipe", False),
-                        }
-                        analog_total_price = cheapest_analog["base_price"] * product["quantity_desired"]
-                        total_sum += analog_total_price
-                        updated_products.append(replacement_product)
-                        replacements_needed += 1
-                        replaced_skus.append({
-                            "original_sku": product["sku"],
-                            "replacement_sku": cheapest_analog["sku"]
-                        })
-                    else:
-                        logger.info(f"Нет доступного аналога для приоритетного товара {product['sku']} в достаточном количестве.")
-
-            else:
-                # Если товар не является приоритетным, обрабатываем его стандартной логикой
-                if product["quantity"] >= product["quantity_desired"]:
-                    product_total_price = product["base_price"] * product["quantity_desired"]
-                    total_sum += product_total_price
-                    updated_products.append(product)
-                else:
-                    # Проверяем наличие аналогов для обычного товара
-                    cheapest_analog = min(product.get("analogs", []), key=lambda analog: analog["base_price"], default=None)
-                    if cheapest_analog and cheapest_analog["quantity"] >= product["quantity_desired"]:
-                        replacement_product = {
-                            "source_code": cheapest_analog["source_code"],
-                            "sku": cheapest_analog["sku"],
-                            "name": cheapest_analog["name"],
-                            "base_price": cheapest_analog["base_price"],
-                            "price_with_warehouse_discount": cheapest_analog["price_with_warehouse_discount"],
-                            "warehouse_discount": cheapest_analog["warehouse_discount"],
-                            "quantity": cheapest_analog["quantity"],
-                            "quantity_desired": product["quantity_desired"],
-                            "diff": product["diff"],
-                            "avg_price": product["avg_price"],
-                            "min_price": product["min_price"],
-                            "pp_packing": cheapest_analog.get("pp_packing", ""),
-                            "manufacturer_id": cheapest_analog.get("manufacturer_id", ""),
-                            "recipe_needed": cheapest_analog.get("recipe_needed", False),
-                            "strong_recipe": cheapest_analog.get("strong_recipe", False),
-                        }
-                        analog_total_price = cheapest_analog["base_price"] * product["quantity_desired"]
-                        total_sum += analog_total_price
-                        updated_products.append(replacement_product)
-                        replacements_needed += 1
-                        replaced_skus.append({
-                            "original_sku": product["sku"],
-                            "replacement_sku": cheapest_analog["sku"]
-                        })
-                    else:
-                        logger.info(f"Нет доступного аналога для товара {product['sku']} в достаточном количестве.")
-
-        # Добавляем аптеку в список только если есть хотя бы один товар
-        if updated_products:
-            pharmacies_with_replacements.append({
-                "source": pharmacy["source"],
-                "products": updated_products,
-                "total_sum": total_sum,
-                "replacements_needed": replacements_needed,
-                "replaced_skus": replaced_skus
-            })
-
-    logger.info(f"Найдено аптек с заменами: {len(pharmacies_with_replacements)}")
-
-    return {"filtered_pharmacies": pharmacies_with_replacements}
-
-
-
-
-# Сортировка аптек по количеству доступных товаров и выбор аптек с наибольшей корзиной
-async def sort_pharmacies_by_fulfillment(pharmacies_with_partial_availability):
-    # Группируем аптеки по количеству доступных товаров в корзине
-    grouped_pharmacies = defaultdict(list)
-
-    for pharmacy in pharmacies_with_partial_availability.get("filtered_pharmacies", []):
-        # Получаем количество товаров в корзине для каждой аптеки
-        num_products = len(pharmacy.get("products", []))
-        grouped_pharmacies[num_products].append(pharmacy)
-
-    # Находим максимальное количество товаров в корзине
-    max_products = max(grouped_pharmacies.keys(), default=0)
-
-    # Берем все аптеки, у которых это максимальное количество товаров
-    top_pharmacies = grouped_pharmacies[max_products]
-
-    # Логируем количество аптек и товаров
-    logger.info(f"Выбрано {len(top_pharmacies)} аптек с максимальной корзиной из {max_products} товаров")
-
-    return {"list_pharmacies": top_pharmacies}
 
 
 # Функция для выбора ближайших 2 аптек
 async def get_top_closest_pharmacies(pharmacies, user_lat, user_lon):
     pharmacies_with_distance = []
-    for pharmacy in pharmacies.get("list_pharmacies", []):
+    for pharmacy in pharmacies.get("filtered_pharmacies", []):
         source_info = pharmacy.get("source", {})
         pharmacy_lat = source_info.get("lat")
         pharmacy_lon = source_info.get("lon")
@@ -342,7 +258,7 @@ async def get_top_closest_pharmacies(pharmacies, user_lat, user_lon):
 # Функция для выбора самых дешевых 3 аптек
 async def get_top_cheapest_pharmacies(pharmacies):
     sorted_pharmacies = sorted(
-        pharmacies.get("list_pharmacies", []),
+        pharmacies.get("filtered_pharmacies", []),
         key=lambda x: x["pharmacy"].get("total_sum", float('inf')) if "pharmacy" in x else float('inf')
     )
 

@@ -64,8 +64,11 @@ async def main_process(request: Request):
             return JSONResponse(content={"error": "No pharmacies found with the provided SKU data"}, status_code=500)
         save_response_to_file(pharmacies, file_name='data1_found_all.json')
 
+        pharmacies_with_missing_items = await filter_pharmacies_with_missing_items(pharmacies, sku_data)
+        save_response_to_file(pharmacies_with_missing_items, file_name='data1_2_found_all__with_missing_items.json')
+
         # Поиск аптек с учетом наличия приоритетного товара
-        filtered_pharmacies = await filter_pharmacies_by_priority_items(pharmacies, sku_data)
+        filtered_pharmacies = await filter_pharmacies_by_priority_items(pharmacies_with_missing_items, sku_data)
         if isinstance(filtered_pharmacies, JSONResponse):
             return filtered_pharmacies
         save_response_to_file(filtered_pharmacies, file_name='data2_found_with_priority.json')
@@ -133,6 +136,49 @@ async def find_medicines_in_pharmacies(encoded_city, payload):
 #         response.raise_for_status()  # Проверка на ошибки
 #         data = response.json()  # Получаем JSON
 #         return data  # Возвращаем JSON данные
+
+
+
+async def filter_pharmacies_with_missing_items(pharmacies, priority_skus):
+    pharmacies_with_missing_items = []
+
+    for pharmacy in pharmacies.get("result", []):
+        products = pharmacy.get("products", [])
+        has_missing_item = False  # Флаг для проверки отсутствия хотя бы одного товара
+
+        for priority_sku in priority_skus:
+            item_found = False  # Отслеживаем, найден ли товар в нужном количестве
+
+            # Проверка наличия основного товара
+            for product in products:
+                if product["sku"] == priority_sku["sku"]:
+                    if product["quantity"] >= priority_sku["count_desired"]:
+                        # Основной товар найден в нужном количестве
+                        item_found = True
+                    else:
+                        # Основного товара недостаточно, проверяем аналоги
+                        available_analogs = [
+                            analog for analog in product.get("analogs", [])
+                            if analog["quantity"] >= priority_sku["count_desired"]
+                        ]
+                        if available_analogs:
+                            # Есть аналоги в нужном количестве
+                            item_found = True
+
+                    # Прекращаем проверку по текущему товару, если он найден в нужном количестве
+                    break
+
+            # Если ни основной товар, ни его аналоги не найдены в достаточном количестве
+            if not item_found:
+                has_missing_item = True
+                break
+
+        # Добавляем аптеку в результат, если хотя бы одного товара не хватает
+        if has_missing_item:
+            pharmacies_with_missing_items.append(pharmacy)
+
+    return {"result": pharmacies_with_missing_items}
+
 
 
 # Фильтр аптек с учетом приоритетности товаров от первого в списке запроса и далее

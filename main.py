@@ -291,10 +291,10 @@ async def filter_pharmacies_by_priority_items(pharmacies, priority_skus):
     for pharmacy in filtered_pharmacies:
         pharmacy["total_sum"] = sum(
             # Если у продукта есть аналог с достаточным количеством, используем его для подсчета суммы
-            (product["analogs"][0]["base_price"] * product["analogs"][0]["quantity_desired"]
+            (product["analogs"][0]["base_price"] * product["analogs"][0]["quantity"]
              if product.get("analogs") and product["analogs"][0]["quantity"] >= product["quantity_desired"]
              # Иначе считаем только основной продукт, если его количество соответствует желаемому
-             else product["base_price"] * product["quantity_desired"] if product["quantity"] >= product["quantity_desired"] else 0)
+             else product["base_price"] * product["quantity"])
             for product in pharmacy["products"]
             if "quantity_desired" in product
         )
